@@ -1,0 +1,237 @@
+---
+- name: db Playbook
+  hosts: db_host
+  become: yes
+  tasks:
+    - name: Update repositories and upgrade packages
+      apt:
+        upgrade: yes
+        update_cache: yes
+        cache_valid_time: 86400
+
+    - name: Install necessary packages
+      apt:
+        name:
+          - postgresql-contrib
+          - postgresql-common
+          - python3
+          - python3-dev
+          - python3-pip
+          - jq
+
+    - name: Create directory for PostgreSQL archive
+      file:
+        path: /oracle/pg_data/archive
+        owner: postgres
+        group: postgres
+        state: directory
+
+    - name: Check if PostgreSQL cluster is initialized
+      command: pg_ctlcluster 16 main status
+      register: postgres_status
+      ignore_errors: true
+
+    - name: Initialize PostgreSQL cluster if not initialized
+      command: pg_createcluster 16 main
+      when: postgres_status.stderr.find('specified cluster \'16 main\' does not exist') != -1
+
+    - name: Get pg_hba.conf path
+      shell: "pg_lsclusters --json | jq -r '.[].config.hba_file'"
+      register: pg_hba_path
+
+    - name: Get postgresql.conf path
+      shell: "pg_lsclusters --json | jq -r '.[].configdir'"
+      register: pg_conf_path
+
+    - name: Configure pg_hba.conf
+      blockinfile:
+        create: true
+        path: "{{ pg_hba_path.stdout }}"
+        block: |
+          local all {{ DB_USER }} peer
+          host all all 0.0.0.0/0 password
+          host replication {{ DB_REPL_USER }} {{ DB_REPL_HOST }}/24 trust
+
+    - name: Configure postgresql.conf
+      blockinfile:
+        create: true
+        path: "{{ pg_conf_path.stdout }}/postgresql.conf"
+        block: | 
+          listen_addresses = '*'
+          port = {{ DB_PORT }}
+          log_destination = 'stderr'
+          logging_collector = on
+          log_directory = '/var/log/postgresql/'
+          log_filename = 'postgresql.log'
+          log_file_mode = 0644
+          archive_mode = on
+          archive_command = 'cp %p /oracle/pg_data/archive/%f'
+          max_wal_senders = 10
+          wal_level = replica
+          wal_log_hints = on
+          log_replication_commands = on
+
+    - name: Restart PostgreSQL
+      service:
+        name: postgresql@16-main
+        state: restarted
+
+    - name: Create master database
+      community.postgresql.postgresql_db:
+        name: "{{ DB_DATABASE }}"
+
+    - name: Create Emails table
+      community.postgresql.postgresql_table:
+        db: "{{ DB_DATABASE }}"
+        name: emails
+        columns:
+          - name: id
+            type: serial
+            primary_key: true
+          - name: email
+            type: text
+
+    - name: Create Phone Numbers table
+      community.postgresql.postgresql_table:
+        db: "{{ DB_DATABASE }}"
+        name: phone_numbers
+        columns:
+          - name: id
+            type: serial
+            primary_key: true
+          - name: value
+            type: text
+
+    - name: Change postgres user password
+      community.postgresql.postgresql_user:
+        name: "{{ DB_USER }}"
+        password: "{{ DB_PASSWORD }}"
+
+    - name: Create replication user
+      community.postgresql.postgresql_user:
+        name: "{{ DB_REPL_USER }}"
+        password: "{{ DB_REPL_PASSWORD }}"
+        role_attr_flags: REPLICATION,LOGIN,SUPERUSER
+
+- name: db_repl Playbook
+  hosts: db_repl
+  become: yes
+  tasks:
+    - name: Update repositories and upgrade packages
+      apt:
+        upgrade: yes
+        update_cache: yes
+        cache_valid_time: 86400
+
+    - name: Install necessary packages
+      apt:
+        name:
+          - postgresql-contrib
+          - postgresql-common
+          - python3
+          - python3-dev
+          - python3-pip
+          - jq
+
+    - name: Check if PostgreSQL cluster is initialized
+      command: pg_ctlcluster 16 main status
+      register: postgres_status
+      ignore_errors: true
+
+    - name: Initialize PostgreSQL cluster if not initialized
+      command: pg_createcluster 16 main
+      when: postgres_status.stderr.find('specified cluster \'16 main\' does not exist') != -1
+
+    - name: Get postgresql.conf path
+      shell: "pg_lsclusters --json | jq -r '.[].configdir'"
+      register: pg_conf_path
+
+    - name: Configure postgresql.conf
+      blockinfile:
+        create: true
+        path: "{{ pg_conf_path.stdout }}/postgresql.conf"
+        block: |
+          listen_addresses = 'localhost, {{ DB_REPL_HOST }}'
+          port = {{ DB_REPL_PORT }}
+
+    - name: Stop PostgreSQL
+      service:
+        name: postgresql@16-main
+        state: stopped
+
+    - name: Get directory for backup
+      shell: "pg_lsclusters --json | jq -r '.[].pgdata'"
+      register: data_dir
+
+    - name: Clean up data directory
+      file:
+        state: absent
+        path: "{{ data_dir.stdout }}"
+
+    - name: Create data directory
+      file:
+        state: directory
+        path: "{{ data_dir.stdout }}"
+        owner: postgres
+        group: postgres
+        mode: 0750
+
+    - name: Perform pg_basebackup
+      command: |
+        pg_basebackup -v -R -h {{ DB_HOST }} -p {{ DB_PORT }} -U {{ DB_REPL_USER }} -w -P -D {{ data_dir.stdout }}
+      become_user: postgres
+      environment:
+        PGPASSWORD: "{{ DB_REPL_PASSWORD }}"
+
+    - name: Start PostgreSQL
+      service:
+        name: postgresql@16-main
+        state: started
+
+- name: bot Playbook
+  hosts: bot_host
+  become: yes
+  tasks:
+    - name: Install necessary packages
+      apt:
+        name: 
+          - postgresql-contrib
+          - postgresql-common
+          - python3
+          - python3-dev
+          - python3-pip
+
+    - name: Install Python packages
+      pip:                
+        name:
+          - python-telegram-bot==13.7
+          - paramiko
+          - psycopg2-binary
+          - python-dotenv
+
+    - name: Create working directory for bot
+      file:
+        path: /srv/devops_bot
+        owner: ansible
+        group: ansible
+        state: directory
+        mode: '0777'
+
+    - name: Download bot script
+      get_url:
+        url: https://github.com/vvard3u/devops_bot/raw/docker/bot/bot.py
+        dest: /srv/devops_bot/bot.py
+        mode: '0755'
+
+    - name: Run bot script
+      command: python3 /srv/devops_bot/bot.py
+      environment:
+        TOKEN: "{{ TOKEN }}"
+        DB_HOST: "{{ DB_HOST }}"
+        DB_USER: "{{ DB_USER }}"
+        DB_PASSWORD: "{{ DB_PASSWORD }}"
+        DB_DATABASE: "{{ DB_DATABASE }}"
+        RM_HOST: "{{ RM_HOST }}"
+        RM_PORT: "{{ RM_PORT }}"
+        RM_USER: "{{ RM_USER }}"
+        RM_PASSWORD: "{{ RM_PASSWORD }}"

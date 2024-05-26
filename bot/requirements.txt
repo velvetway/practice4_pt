@@ -1,6 +1,0 @@
-paramiko
-psycopg2-binary==2.9.1
-telebot
-aiogram==3.3
-python-telegram-bot==13.7
-python-dotenv
